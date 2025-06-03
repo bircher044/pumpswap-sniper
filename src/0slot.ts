@@ -1,7 +1,6 @@
 import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, VersionedTransaction } from "@solana/web3.js";
 
 export const getTipInstruction = (fromPubkey: PublicKey, lamports: number) => {
-    console.log("tipLamports", lamports);
     if (lamports < 1000000) throw new Error("Tip amount < 0.001 SOL");
     if (lamports > LAMPORTS_PER_SOL) throw new Error("Tip amount > 1 SOL");
 
