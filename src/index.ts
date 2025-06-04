@@ -12,52 +12,48 @@ import {
 } from "@solana/web3.js";
 import {
     createAssociatedTokenAccountIdempotentInstruction,
-    createCloseAccountInstruction,
     createSyncNativeInstruction,
     getAccount,
     getAssociatedTokenAddressSync,
+    NATIVE_MINT,
 } from "@solana/spl-token";
 import { BN, BorshCoder } from "@coral-xyz/anchor";
 import { bs58 } from "@coral-xyz/anchor/dist/cjs/utils/bytes";
 import { pumpswap } from "./pumpswapIDL";
-import { getTipInstruction, sendTransaction } from "./0slot";
 import { GRPCResponse } from "./grpc-response";
 import Client, { CommitmentLevel } from "@triton-one/yellowstone-grpc";
 import { convertBuffers } from "./convert-buffer";
 import { calculateBaseFromQuote, getBuyIx, getSellIx } from "./pumpswap";
 import type { ClientDuplexStream } from "@grpc/grpc-js";
 import type { SubscribeRequest, SubscribeUpdate } from "@triton-one/yellowstone-grpc";
+import { loadBuyersCsv } from "./utils/read-csv";
 
-import { decodeSystemTransferIx } from "./system-program";
-import { loadBuyersCsv, loadTargetsCsv, writeTargetsCsv } from "./utils/read-csv";
-import { SYSTEM_PROGRAM_ID } from "@coral-xyz/anchor/dist/cjs/native/system";
-import { getDate } from "./utils/date";
 dotenv.config();
 const connection = new Connection(process.env.RPC_URL!, "processed");
 
-const ZERO_SLOT_TIP = 0.001 * LAMPORTS_PER_SOL;
+const BUY_AMOUNT = BigInt(0.01 * LAMPORTS_PER_SOL);
+const SELL_TIMEOUT = 60000; // milliseconds
+const PROFIT_TARGET = BigInt(0.02 * LAMPORTS_PER_SOL);
+
+//const ZERO_SLOT_TIP = 0.001 * LAMPORTS_PER_SOL;
+const BUY_PRIORITY_FEE = 100000; //micro lamports
 const SELL_PRIORITY_FEE = 50000; // micro lamports
 const SELL_MIN_AMOUNT = BigInt(0.001 * LAMPORTS_PER_SOL);
 
 const QUOTE_AMOUNT_OUT = BigInt(0);
-const TRANSFER_MIN_AMOUNT = 100 * LAMPORTS_PER_SOL;
 
+let buyers: Keypair[] = [];
 let currentBuyerIndex = 0;
-const MAX_PROFIT_RUG_DIFFERENCE = 3;
+
+let currentInside = 0;
+let currentProfits = 0;
+let currentRugs = 0;
+let currentTimeouts = 0;
+
+const INSIDE_LIMIT = 7;
 
 const eventEmitter = new EventEmitter();
 const pumpswapCoder = new BorshCoder(pumpswap);
-
-let buyers: Keypair[] = [];
-
-let targets: PublicKey[] = [];
-let profits: number[] = [];
-let rugs: number[] = [];
-let timeouts: number[] = [];
-let buyAmountSol: number[] = [];
-let takeProfitSol: number[] = [];
-let timeoutMs: number[] = [];
-let lastUpdate: string[] = [];
 
 const client = new Client(process.env.GRPC_URL!, undefined, {
     "grpc.max_receive_message_length": 1024 * 1024 * 1024,
@@ -118,16 +114,9 @@ async function startSubscription() {
                     createPool: {
                         vote: false,
                         failed: false,
-                        accountInclude: [...targets.map((t) => t.toBase58())],
+                        accountInclude: [],
                         accountExclude: [],
                         accountRequired: [pumpswap.address],
-                    },
-                    transfer: {
-                        vote: false,
-                        failed: false,
-                        accountInclude: [...targets.map((t) => t.toBase58())],
-                        accountExclude: [],
-                        accountRequired: [SystemProgram.programId.toBase58()],
                     },
                 },
                 accounts: {},
@@ -152,17 +141,8 @@ async function startSubscription() {
 }
 
 eventEmitter.on("transaction", async (grpcResponse: GRPCResponse) => {
-    const accountKeys = grpcResponse.transaction.transaction.message.accountKeys.map((key) => new PublicKey(key));
-
-    const hasThirdPartyProgram = grpcResponse.transaction.transaction.message.instructions.some((ix) => {
-        if (accountKeys[ix.programIdIndex].toBase58() === SYSTEM_PROGRAM_ID.toBase58()) return false;
-        if (accountKeys[ix.programIdIndex].toBase58() === ComputeBudgetProgram.programId.toBase58()) return false;
-        return true;
-    });
-    if (!hasThirdPartyProgram) {
-        grpcResponse.transaction.transaction.message.instructions.map((ix) => {
-            eventEmitter.emit("transfer", ix, accountKeys);
-        });
+    if (currentInside > INSIDE_LIMIT) {
+        return;
     }
 
     const createIx = grpcResponse.transaction.transaction.message.instructions.find((i) =>
@@ -172,15 +152,19 @@ eventEmitter.on("transaction", async (grpcResponse: GRPCResponse) => {
     if (!createIx) {
         return;
     }
-    const keys = grpcResponse.transaction.transaction.message.accountKeys;
+
+    if (grpcResponse.transaction.transaction.message.accountKeys[createIx.accounts[3]] !== NATIVE_MINT.toBase58()) {
+        return;
+    }
+
     console.log("Create pool instruction found in transaction", grpcResponse.transaction.transaction.signatures[0]);
 
     eventEmitter.emit(
         "pool",
-        new PublicKey(keys[createIx.accounts[0]]),
-        new PublicKey(keys[createIx.accounts[3]]),
-        new PublicKey(keys[createIx.accounts[4]]),
-        new PublicKey(keys[createIx.accounts[2]]),
+        new PublicKey(grpcResponse.transaction.transaction.message.accountKeys[createIx.accounts[0]]),
+        new PublicKey(grpcResponse.transaction.transaction.message.accountKeys[createIx.accounts[3]]),
+        new PublicKey(grpcResponse.transaction.transaction.message.accountKeys[createIx.accounts[4]]),
+        new PublicKey(grpcResponse.transaction.transaction.message.accountKeys[createIx.accounts[2]]),
         currentBuyerIndex,
         grpcResponse.transaction.transaction.message.recentBlockhash
     );
@@ -191,17 +175,8 @@ eventEmitter.on(
     "pool",
     async (pool: PublicKey, baseMint: PublicKey, quoteMint: PublicKey, creator: PublicKey, buyerIndex: number, recentBlockhash: string) => {
         try {
-            const creatorIndex = targets.findIndex((target) => target.toBase58() === creator.toBase58());
-            if (rugs[creatorIndex] - profits[creatorIndex] > MAX_PROFIT_RUG_DIFFERENCE) {
-                console.log("Skipping pool due to high profit/rug difference for creator", creator.toBase58());
-                return;
-            }
-
             const wsolAta = getAssociatedTokenAddressSync(baseMint, buyers[buyerIndex].publicKey);
             const tokenAta = getAssociatedTokenAddressSync(quoteMint, buyers[buyerIndex].publicKey);
-
-            console.log(`buy amount for buyer ${buyerIndex}:`, buyAmountSol[creatorIndex]);
-
             const tx = new VersionedTransaction(
                 new TransactionMessage({
                     payerKey: buyers[buyerIndex].publicKey,
@@ -216,7 +191,7 @@ eventEmitter.on(
                         SystemProgram.transfer({
                             fromPubkey: buyers[buyerIndex].publicKey,
                             toPubkey: wsolAta,
-                            lamports: BigInt(buyAmountSol[creatorIndex] * LAMPORTS_PER_SOL) + BigInt(10001),
+                            lamports: BUY_AMOUNT + BigInt(10001),
                         }),
                         createSyncNativeInstruction(wsolAta),
                         createAssociatedTokenAccountIdempotentInstruction(
@@ -225,15 +200,9 @@ eventEmitter.on(
                             buyers[buyerIndex].publicKey,
                             quoteMint
                         ),
-                        getSellIx(
-                            pool,
-                            baseMint,
-                            quoteMint,
-                            buyers[buyerIndex].publicKey,
-                            BigInt(buyAmountSol[creatorIndex] * LAMPORTS_PER_SOL),
-                            QUOTE_AMOUNT_OUT
-                        ),
-                        getTipInstruction(buyers[buyerIndex].publicKey, ZERO_SLOT_TIP),
+                        getSellIx(pool, baseMint, quoteMint, buyers[buyerIndex].publicKey, BUY_AMOUNT, QUOTE_AMOUNT_OUT),
+                        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: BUY_PRIORITY_FEE }),
+                        //getTipInstruction(buyers[buyerIndex].publicKey, ZERO_SLOT_TIP),
                     ],
                 }).compileToV0Message()
             );
@@ -241,8 +210,13 @@ eventEmitter.on(
             tx.sign([buyers[buyerIndex]]);
             console.log("buyer", buyers[currentBuyerIndex].publicKey.toBase58());
 
-            await sendTransaction(tx);
+            const id = await connection.sendTransaction(tx, { skipPreflight: true });
             console.log(quoteMint.toBase58(), "buy transaction sent", bs58.encode(tx.signatures[0]));
+
+            const { lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+            await connection
+                .confirmTransaction({ blockhash: recentBlockhash, lastValidBlockHeight: lastValidBlockHeight, signature: id }, "processed")
+                .catch();
             eventEmitter.emit("exit", pool, baseMint, quoteMint, buyerIndex, creator);
         } catch (error) {
             console.error("Error processing buy transaction:", error);
@@ -253,31 +227,27 @@ eventEmitter.on(
 );
 
 eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: PublicKey, buyerIndex: number, creator: PublicKey) => {
+    currentInside = currentInside + 1;
     try {
         const tokenAta = getAssociatedTokenAddressSync(quoteMint, buyers[buyerIndex].publicKey);
 
         const startTime = Date.now();
 
-        const creatorIndex = targets.findIndex((target) => target.toBase58() === creator.toBase58());
-        lastUpdate[creatorIndex] = getDate();
-
-        if (creatorIndex === -1) {
-            console.error("invalid creator index", creator.toBase58());
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, 4000));
+        //await new Promise((resolve) => setTimeout(resolve, 4000));
         let tokenAmount = (await getAccount(connection, tokenAta, "processed")).amount;
         if (tokenAmount < BigInt(100)) {
             console.log("No tokens to sell (freeze possible).");
+            currentInside--;
             return;
         }
 
         let shouldSell = false;
         while (!shouldSell) {
             try {
-                if (Date.now() - startTime > timeoutMs[creatorIndex]) {
+                if (Date.now() - startTime > SELL_TIMEOUT) {
                     console.log("Timeout reached, exiting.");
-                    timeouts[creatorIndex] = timeouts[creatorIndex] + 1;
+                    currentTimeouts++;
+                    shouldSell = true;
                     break;
                 }
 
@@ -285,51 +255,49 @@ eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
 
                 console.log(
                     `token: ${quoteMint}, value: ${(Number(solAmount) / LAMPORTS_PER_SOL).toFixed(4)}, profitTarget: ${Number(
-                        takeProfitSol[creatorIndex]
-                    ).toFixed(4)}, time left: ${(timeoutMs[creatorIndex] - (Date.now() - startTime)) / 1000} seconds`
+                        Number(PROFIT_TARGET) / LAMPORTS_PER_SOL
+                    ).toFixed(4)}, time left: ${(SELL_TIMEOUT - (Date.now() - startTime)) / 1000} seconds`
                 );
 
-                if (solAmount >= BigInt(takeProfitSol[creatorIndex] * LAMPORTS_PER_SOL)) {
+                if (solAmount >= PROFIT_TARGET) {
                     console.log("Profit target reached.");
-                    profits[creatorIndex] = profits[creatorIndex] + 1;
+                    currentProfits++;
                     shouldSell = true;
                     break;
                 }
                 if (solAmount < BigInt(10000)) {
+                    currentRugs++;
                     console.log("YOU GOT RUGGED");
-                    rugs[creatorIndex] = rugs[creatorIndex] + 1;
-
-                    writeTargetsCsv("targets.csv", targets, profits, rugs, timeouts, buyAmountSol, takeProfitSol, timeoutMs, lastUpdate);
-                    return;
+                    break;
                 }
                 await new Promise((r) => setTimeout(r, 1000));
             } catch (error) {
                 console.error("Error calculating base from quote:", error);
             }
         }
+        if (shouldSell) {
+            let solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 10);
 
-        writeTargetsCsv("targets.csv", targets, profits, rugs, timeouts, buyAmountSol, takeProfitSol, timeoutMs, lastUpdate);
+            for (let i = 0; i < 5; i++) {
+                try {
+                    if (BigInt(solAmount.toString()) < SELL_MIN_AMOUNT) {
+                        break;
+                    }
+                    eventEmitter.emit("sell", pool, baseMint, quoteMint, buyerIndex, solAmount);
 
-        let solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 10);
+                    await new Promise((r) => setTimeout(r, 3000));
 
-        for (let i = 0; i < 5; i++) {
-            try {
-                if (BigInt(solAmount.toString()) < SELL_MIN_AMOUNT) {
-                    break;
-                }
-                eventEmitter.emit("sell", pool, baseMint, quoteMint, buyerIndex, solAmount);
-
-                await new Promise((r) => setTimeout(r, 3000));
-
-                solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 10);
-                tokenAmount = (await getAccount(connection, tokenAta, "processed")).amount;
-            } catch {}
+                    solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 10);
+                    tokenAmount = (await getAccount(connection, tokenAta, "processed")).amount;
+                } catch {}
+            }
         }
     } catch (error) {
         console.error("Error processing exit:", error);
         console.error("Pool:", pool.toBase58(), "Base Mint:", baseMint.toBase58(), "Quote Mint:", quoteMint.toBase58());
         console.error("Buyer Index:", buyerIndex);
     }
+    currentInside = currentInside - 1;
 });
 
 eventEmitter.on("sell", async (pool: PublicKey, baseMint: PublicKey, quoteMint: PublicKey, buyerIndex: number, solAmount: BN) => {
@@ -363,75 +331,45 @@ eventEmitter.on("sell", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
     }
 });
 
-eventEmitter.on(
-    "transfer",
-    async (
-        transferIx: {
-            programIdIndex: number;
-            accounts: Array<number>;
-            data: string;
-        },
-        accountKeys: PublicKey[]
-    ) => {
-        try {
-            const decodedIx = decodeSystemTransferIx(transferIx, accountKeys);
-            if (!decodedIx) {
-                return;
-            }
+function setupConsoleInput() {
+    process.stdin.setEncoding("utf8");
 
-            if (Number(decodedIx.lamports) < TRANSFER_MIN_AMOUNT) {
-                return;
-            }
-            // console.log("Decoded lamports:", Number(decodedIx.lamports) / LAMPORTS_PER_SOL);
-            // console.log("from", decodedIx.from, "to", decodedIx.to);
-            const index = targets.findIndex((pk) => pk.toBase58() === decodedIx.from);
-            if (index !== -1) {
-                targets[index] = new PublicKey(decodedIx.to);
-                lastUpdate[index] = getDate();
-                console.log(`Target updated: ${decodedIx.from} -> ${decodedIx.to}`);
+    process.stdin.on("data", (input: string) => {
+        const command = input.trim().toLowerCase();
 
-                writeTargetsCsv("targets.csv", targets, profits, rugs, timeouts, buyAmountSol, takeProfitSol, timeoutMs, lastUpdate);
-
-                await startSubscription();
-            } else {
-                console.log(`Target not found for: ${decodedIx.from}`);
-            }
-        } catch (error) {
-            console.error("Error processing transfer instruction:", error);
-            console.error("Transfer Instruction:", transferIx);
-            console.error(
-                "Account Keys:",
-                accountKeys.map((key) => key.toBase58())
-            );
+        switch (command) {
+            case "stop":
+                currentInside += 10000;
+                console.log("🛑 Buying stopped. Will only sell.");
+                break;
+            case "start":
+                currentInside -= 10000;
+                console.log("▶️ Resumed buying.");
+                break;
+            case "exit":
+                console.log("🚪 Exiting gracefully...");
+                process.exit(0);
+            default:
+                console.log(`❓ Unknown command: "${command}". Try "stop", "start", or "exit".`);
         }
-    }
-);
+    });
+}
 
 async function main() {
+    setupConsoleInput();
+    //write current inside every 60 seconds
+
+    setInterval(() => {
+        console.log(`CurrentInside: ${currentInside}`);
+        console.log(`CurrentProfits: ${currentProfits}`);
+        console.log(`CurrentRugs: ${currentRugs}`);
+        console.log(`CurrentTimeouts: ${currentTimeouts}`);
+    }, 60000);
+
     buyers = await loadBuyersCsv("buyers.csv");
-    const [
-        targetsValues,
-        profitsValues,
-        rugsValues,
-        timeoutsValues,
-        buyAmountSolValues,
-        takeProfitSolValues,
-        timeoutMsValues,
-        lastUpdateValues,
-    ] = await loadTargetsCsv("targets.csv");
 
     currentBuyerIndex = Math.floor(Math.random() * buyers.length);
     console.log("Current buyer index:", currentBuyerIndex);
-    console.log("date", getDate());
-    targets = targetsValues;
-    profits = profitsValues;
-    rugs = rugsValues;
-    timeouts = timeoutsValues;
-    buyAmountSol = buyAmountSolValues;
-    takeProfitSol = takeProfitSolValues;
-    timeoutMs = timeoutMsValues;
-    lastUpdate = lastUpdateValues;
-
     await startSubscription();
     console.log("Subscription started. Waiting for transactions...");
 }
