@@ -1,5 +1,5 @@
 import { bs58 } from "@coral-xyz/anchor/dist/cjs/utils/bytes";
-import { PublicKey, SystemProgram } from "@solana/web3.js";
+import { LAMPORTS_PER_SOL, PublicKey, SystemProgram } from "@solana/web3.js";
 
 export function decodeSystemTransferIx(ix: { programIdIndex: number; accounts: number[]; data: string }, accountKeys: PublicKey[]) {
     const programId = accountKeys[ix.programIdIndex];
