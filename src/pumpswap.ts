@@ -289,9 +289,23 @@ export function getSellIx(
     });
 }
 
-export async function calculateBaseFromQuote(connection: Connection, pool: PublicKey, quoteAmount: BN, slippage: number) {
-    const sdk = new PumpAmmSdk(connection);
-    const baseAmountOut = await sdk.swapAutocompleteBaseFromQuote(pool, quoteAmount, slippage, "quoteToBase");
+export function getBaseAmountOutFromQuoteIn(
+    baseTokenLiq: BN,
+    quoteTokenLiq: BN,
+    quoteAmountIn: BN,
+    slippage: number
+): { baseAmountOut: BN; minBaseAmountOut: BN } {
+    const denominator = quoteTokenLiq.add(quoteAmountIn);
+    const baseAmountOut = quoteAmountIn.mul(baseTokenLiq).div(denominator);
 
-    return baseAmountOut;
+    const minBaseAmountOut = baseAmountOut.mul(new BN(100 - slippage)).div(new BN(100));
+
+    return { baseAmountOut, minBaseAmountOut };
+}
+
+export async function calculateQuoteFromBase(connection: Connection, pool: PublicKey, baseAmount: BN, slippage: number) {
+    const sdk = new PumpAmmSdk(connection);
+    const quoteAmountOut = await sdk.swapAutocompleteQuoteFromBase(pool, baseAmount, slippage, "baseToQuote");
+
+    return quoteAmountOut;
 }

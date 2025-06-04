@@ -12,6 +12,7 @@ import {
 } from "@solana/web3.js";
 import {
     createAssociatedTokenAccountIdempotentInstruction,
+    createCloseAccountInstruction,
     createSyncNativeInstruction,
     getAccount,
     getAssociatedTokenAddressSync,
@@ -23,7 +24,7 @@ import { pumpswap } from "./pumpswapIDL";
 import { GRPCResponse } from "./grpc-response";
 import Client, { CommitmentLevel } from "@triton-one/yellowstone-grpc";
 import { convertBuffers } from "./convert-buffer";
-import { calculateBaseFromQuote, getBuyIx, getSellIx } from "./pumpswap";
+import { getBuyIx, getBaseAmountOutFromQuoteIn, getSellIx, calculateQuoteFromBase } from "./pumpswap";
 import type { ClientDuplexStream } from "@grpc/grpc-js";
 import type { SubscribeRequest, SubscribeUpdate } from "@triton-one/yellowstone-grpc";
 import { loadBuyersCsv } from "./utils/read-csv";
@@ -31,16 +32,15 @@ import { loadBuyersCsv } from "./utils/read-csv";
 dotenv.config();
 const connection = new Connection(process.env.RPC_URL!, "processed");
 
-const BUY_AMOUNT = BigInt(0.01 * LAMPORTS_PER_SOL);
-const SELL_TIMEOUT = 60000; // milliseconds
+const BUY_AMOUNT = BigInt(0.011 * LAMPORTS_PER_SOL);
+const SLIPPAGE = 10;
+const SELL_TIMEOUT = 30000; // milliseconds
 const PROFIT_TARGET = BigInt(0.02 * LAMPORTS_PER_SOL);
 
 //const ZERO_SLOT_TIP = 0.001 * LAMPORTS_PER_SOL;
 const BUY_PRIORITY_FEE = 100000; //micro lamports
 const SELL_PRIORITY_FEE = 50000; // micro lamports
 const SELL_MIN_AMOUNT = BigInt(0.001 * LAMPORTS_PER_SOL);
-
-const QUOTE_AMOUNT_OUT = BigInt(0);
 
 let buyers: Keypair[] = [];
 let currentBuyerIndex = 0;
@@ -141,7 +141,7 @@ async function startSubscription() {
 }
 
 eventEmitter.on("transaction", async (grpcResponse: GRPCResponse) => {
-    if (currentInside > INSIDE_LIMIT) {
+    if (currentInside >= INSIDE_LIMIT) {
         return;
     }
 
@@ -153,9 +153,18 @@ eventEmitter.on("transaction", async (grpcResponse: GRPCResponse) => {
         return;
     }
 
-    if (grpcResponse.transaction.transaction.message.accountKeys[createIx.accounts[3]] !== NATIVE_MINT.toBase58()) {
+    if (grpcResponse.transaction.transaction.message.accountKeys[createIx.accounts[4]] !== NATIVE_MINT.toBase58()) {
+        console.log(grpcResponse.transaction.transaction.message.accountKeys[createIx.accounts[4]]);
         return;
     }
+
+    const data = pumpswapCoder.instruction.decode(createIx.data, "base58");
+    if (!data) {
+        console.log("failed to decode");
+        return;
+    }
+    const baseAmount = (data.data as any).base_amount_in as BN;
+    const quoteAmount = (data.data as any).quote_amount_in as BN;
 
     console.log("Create pool instruction found in transaction", grpcResponse.transaction.transaction.signatures[0]);
 
@@ -165,6 +174,8 @@ eventEmitter.on("transaction", async (grpcResponse: GRPCResponse) => {
         new PublicKey(grpcResponse.transaction.transaction.message.accountKeys[createIx.accounts[3]]),
         new PublicKey(grpcResponse.transaction.transaction.message.accountKeys[createIx.accounts[4]]),
         new PublicKey(grpcResponse.transaction.transaction.message.accountKeys[createIx.accounts[2]]),
+        baseAmount,
+        quoteAmount,
         currentBuyerIndex,
         grpcResponse.transaction.transaction.message.recentBlockhash
     );
@@ -173,10 +184,21 @@ eventEmitter.on("transaction", async (grpcResponse: GRPCResponse) => {
 
 eventEmitter.on(
     "pool",
-    async (pool: PublicKey, baseMint: PublicKey, quoteMint: PublicKey, creator: PublicKey, buyerIndex: number, recentBlockhash: string) => {
+    async (
+        pool: PublicKey,
+        baseMint: PublicKey,
+        quoteMint: PublicKey,
+        creator: PublicKey,
+        baseIn: BN,
+        quoteIn: BN,
+        buyerIndex: number,
+        recentBlockhash: string
+    ) => {
         try {
-            const wsolAta = getAssociatedTokenAddressSync(baseMint, buyers[buyerIndex].publicKey);
-            const tokenAta = getAssociatedTokenAddressSync(quoteMint, buyers[buyerIndex].publicKey);
+            const wsolAta = getAssociatedTokenAddressSync(quoteMint, buyers[buyerIndex].publicKey);
+            const tokenAta = getAssociatedTokenAddressSync(baseMint, buyers[buyerIndex].publicKey);
+
+            const { minBaseAmountOut } = getBaseAmountOutFromQuoteIn(baseIn, quoteIn, new BN(BUY_AMOUNT.toString()), SLIPPAGE);
             const tx = new VersionedTransaction(
                 new TransactionMessage({
                     payerKey: buyers[buyerIndex].publicKey,
@@ -186,21 +208,21 @@ eventEmitter.on(
                             buyers[buyerIndex].publicKey,
                             wsolAta,
                             buyers[buyerIndex].publicKey,
-                            baseMint
+                            quoteMint
                         ),
                         SystemProgram.transfer({
                             fromPubkey: buyers[buyerIndex].publicKey,
                             toPubkey: wsolAta,
-                            lamports: BUY_AMOUNT + BigInt(10001),
+                            lamports: BUY_AMOUNT,
                         }),
                         createSyncNativeInstruction(wsolAta),
                         createAssociatedTokenAccountIdempotentInstruction(
                             buyers[buyerIndex].publicKey,
                             tokenAta,
                             buyers[buyerIndex].publicKey,
-                            quoteMint
+                            baseMint
                         ),
-                        getSellIx(pool, baseMint, quoteMint, buyers[buyerIndex].publicKey, BUY_AMOUNT, QUOTE_AMOUNT_OUT),
+                        getBuyIx(pool, baseMint, quoteMint, buyers[buyerIndex].publicKey, BigInt(minBaseAmountOut.toString()), BUY_AMOUNT),
                         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: BUY_PRIORITY_FEE }),
                         //getTipInstruction(buyers[buyerIndex].publicKey, ZERO_SLOT_TIP),
                     ],
@@ -229,7 +251,7 @@ eventEmitter.on(
 eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: PublicKey, buyerIndex: number, creator: PublicKey) => {
     currentInside = currentInside + 1;
     try {
-        const tokenAta = getAssociatedTokenAddressSync(quoteMint, buyers[buyerIndex].publicKey);
+        const tokenAta = getAssociatedTokenAddressSync(baseMint, buyers[buyerIndex].publicKey);
 
         const startTime = Date.now();
 
@@ -251,10 +273,10 @@ eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
                     break;
                 }
 
-                const solAmount = BigInt((await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 5)).toString());
+                const solAmount = BigInt((await calculateQuoteFromBase(connection, pool, new BN(tokenAmount.toString()), 5)).toString());
 
                 console.log(
-                    `token: ${quoteMint}, value: ${(Number(solAmount) / LAMPORTS_PER_SOL).toFixed(4)}, profitTarget: ${Number(
+                    `token: ${baseMint}, value: ${(Number(solAmount) / LAMPORTS_PER_SOL).toFixed(4)}, profitTarget: ${Number(
                         Number(PROFIT_TARGET) / LAMPORTS_PER_SOL
                     ).toFixed(4)}, time left: ${(SELL_TIMEOUT - (Date.now() - startTime)) / 1000} seconds`
                 );
@@ -265,7 +287,7 @@ eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
                     shouldSell = true;
                     break;
                 }
-                if (solAmount < BigInt(10000)) {
+                if (solAmount < BigInt(100000)) {
                     currentRugs++;
                     console.log("YOU GOT RUGGED");
                     break;
@@ -276,18 +298,18 @@ eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
             }
         }
         if (shouldSell) {
-            let solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 10);
+            let solAmount = await calculateQuoteFromBase(connection, pool, new BN(tokenAmount.toString()), 10);
 
             for (let i = 0; i < 5; i++) {
                 try {
                     if (BigInt(solAmount.toString()) < SELL_MIN_AMOUNT) {
                         break;
                     }
-                    eventEmitter.emit("sell", pool, baseMint, quoteMint, buyerIndex, solAmount);
+                    eventEmitter.emit("sell", pool, baseMint, quoteMint, buyerIndex);
 
                     await new Promise((r) => setTimeout(r, 3000));
 
-                    solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 10);
+                    solAmount = await calculateQuoteFromBase(connection, pool, new BN(tokenAmount.toString()), 10);
                     tokenAmount = (await getAccount(connection, tokenAta, "processed")).amount;
                 } catch {}
             }
@@ -300,19 +322,20 @@ eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
     currentInside = currentInside - 1;
 });
 
-eventEmitter.on("sell", async (pool: PublicKey, baseMint: PublicKey, quoteMint: PublicKey, buyerIndex: number, solAmount: BN) => {
+eventEmitter.on("sell", async (pool: PublicKey, baseMint: PublicKey, quoteMint: PublicKey, buyerIndex: number) => {
     try {
-        const tokenAta = getAssociatedTokenAddressSync(quoteMint, buyers[buyerIndex].publicKey);
+        const tokenAta = getAssociatedTokenAddressSync(baseMint, buyers[buyerIndex].publicKey);
+        const wsolAta = getAssociatedTokenAddressSync(quoteMint, buyers[buyerIndex].publicKey);
         const tokenAmount = (await getAccount(connection, tokenAta, "processed")).amount;
-        //const wsolAta = getAssociatedTokenAddressSync(baseMint, buyers[buyerIndex].publicKey);
 
         const sellTx = new VersionedTransaction(
             new TransactionMessage({
                 payerKey: buyers[buyerIndex].publicKey,
                 recentBlockhash: (await connection.getLatestBlockhash()).blockhash,
                 instructions: [
-                    getBuyIx(pool, baseMint, quoteMint, buyers[buyerIndex].publicKey, BigInt(solAmount.toString()), BigInt(tokenAmount)),
-                    //createCloseAccountInstruction(wsolAta, buyers[buyerIndex].publicKey, buyers[buyerIndex].publicKey),
+                    getSellIx(pool, baseMint, quoteMint, buyers[buyerIndex].publicKey, tokenAmount, BigInt(0)),
+                    createCloseAccountInstruction(wsolAta, buyers[buyerIndex].publicKey, buyers[buyerIndex].publicKey),
+                    createCloseAccountInstruction(tokenAta, buyers[buyerIndex].publicKey, buyers[buyerIndex].publicKey),
                     ComputeBudgetProgram.setComputeUnitPrice({
                         microLamports: SELL_PRIORITY_FEE,
                     }),
@@ -323,11 +346,9 @@ eventEmitter.on("sell", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
         await connection.sendTransaction(sellTx, {
             skipPreflight: true,
         });
-        console.log(quoteMint.toBase58(), "Sell transaction sent", bs58.encode(sellTx.signatures[0]));
+        console.log("Sell transaction sent", bs58.encode(sellTx.signatures[0]));
     } catch (error) {
         console.error("Error processing sell transaction:", error);
-        console.error("Pool:", pool.toBase58(), "Base Mint:", baseMint.toBase58(), "Quote Mint:", quoteMint.toBase58());
-        console.error("Buyer Index:", buyerIndex);
     }
 });
 
