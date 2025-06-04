@@ -4,13 +4,13 @@ import { PublicKey, SystemProgram } from "@solana/web3.js";
 export function decodeSystemTransferIx(ix: { programIdIndex: number; accounts: number[]; data: string }, accountKeys: PublicKey[]) {
     const programId = accountKeys[ix.programIdIndex];
     if (!programId.equals(SystemProgram.programId)) {
-        throw new Error("Not a System Program instruction");
+        return null;
     }
 
     const data = bs58.decode(ix.data);
     const instruction = data.readUInt32LE(0);
     if (instruction !== 2) {
-        throw new Error("Not a transfer instruction");
+        return null;
     }
 
     const lamports = data.readBigUInt64LE(4);

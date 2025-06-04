@@ -35,12 +35,15 @@ dotenv.config();
 
 const ZERO_SLOT_TIP = 0.001 * LAMPORTS_PER_SOL;
 
-const BASE_AMOUNT_IN = BigInt(0.02 * LAMPORTS_PER_SOL);
-const PROFIT_TARGET = BigInt(0.0387 * LAMPORTS_PER_SOL);
+const BASE_AMOUNT_IN = BigInt(0.01 * LAMPORTS_PER_SOL);
+const PROFIT_TARGET = BigInt(0.0198 * LAMPORTS_PER_SOL);
 
 const QUOTE_AMOUNT_OUT = BigInt(0);
 const TRANSFER_MIN_AMOUNT = 100 * LAMPORTS_PER_SOL;
+
 const SELL_TIMEOUT = 5 * 60000; ///5 mins
+const SELL_PRIORITY_FEE = 50000; // micro lamports
+const SELL_MIN_AMOUNT = BigInt(0.001 * LAMPORTS_PER_SOL);
 
 let currentBuyerIndex = 0;
 const MAX_PROFIT_RUG_DIFFERENCE = 3;
@@ -157,23 +160,7 @@ eventEmitter.on("transaction", async (grpcResponse: GRPCResponse) => {
         return true;
     });
     if (!hasThirdPartyProgram) {
-        const isTransferIx = grpcResponse.transaction.transaction.message.instructions.map((ix) => {
-            const programId = accountKeys[ix.programIdIndex];
-            if (!programId.equals(SystemProgram.programId)) {
-                return false;
-            }
-
-            const data = bs58.decode(ix.data);
-            if (data.length < 8) {
-                return false;
-            }
-
-            const instruction = data.readUInt32LE(0);
-            return instruction === 2;
-        });
-
-        const transferIxs = grpcResponse.transaction.transaction.message.instructions.filter((ix, index) => isTransferIx[index]);
-        transferIxs.map((ix) => {
+        grpcResponse.transaction.transaction.message.instructions.map((ix) => {
             eventEmitter.emit("transfer", ix, accountKeys);
         });
     }
@@ -269,13 +256,18 @@ eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
         }
 
         await new Promise((resolve) => setTimeout(resolve, 2000));
-        const tokenAmount = (await getAccount(connection, tokenAta, "processed")).amount;
+        let tokenAmount = (await getAccount(connection, tokenAta, "processed")).amount;
         if (tokenAmount < BigInt(100)) {
             console.log("No tokens to sell (freeze possible).");
             return;
         }
-        while (!shouldSell && Date.now() - startTime < SELL_TIMEOUT) {
+        while (!shouldSell) {
             try {
+                if (Date.now() - startTime > SELL_TIMEOUT) {
+                    timeouts[creatorIndex] = timeouts[creatorIndex] + 1;
+                    break;
+                }
+
                 const solAmount = BigInt((await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 5)).toString());
 
                 console.log(
@@ -302,31 +294,57 @@ eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
                 console.error("Error calculating base from quote:", error);
             }
         }
-        if (Date.now() - startTime > SELL_TIMEOUT) {
-            timeouts[creatorIndex] = timeouts[creatorIndex] + 1;
-        }
 
         writeTargetsCsv("targets.csv", targets, profits, rugs, timeouts);
 
-        const solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 10);
+        let solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 10);
 
-        const wsolAta = getAssociatedTokenAddressSync(baseMint, buyers[buyerIndex].publicKey);
+        for (let i = 0; i < 5; i++) {
+            try {
+                if (BigInt(solAmount.toString()) < SELL_MIN_AMOUNT) {
+                    break;
+                }
+                eventEmitter.emit("sell", pool, baseMint, quoteMint, buyerIndex, solAmount);
+
+                await new Promise((r) => setTimeout(r, 2000));
+
+                solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 10);
+                tokenAmount = (await getAccount(connection, tokenAta, "processed")).amount;
+            } catch {}
+        }
+    } catch (error) {
+        console.error("Error processing exit:", error);
+        console.error("Pool:", pool.toBase58(), "Base Mint:", baseMint.toBase58(), "Quote Mint:", quoteMint.toBase58());
+        console.error("Buyer Index:", buyerIndex);
+    }
+});
+
+eventEmitter.on("sell", async (pool: PublicKey, baseMint: PublicKey, quoteMint: PublicKey, buyerIndex: number, solAmount: BN) => {
+    try {
+        const tokenAta = getAssociatedTokenAddressSync(quoteMint, buyers[buyerIndex].publicKey);
+        const tokenAmount = (await getAccount(connection, tokenAta, "processed")).amount;
+        //const wsolAta = getAssociatedTokenAddressSync(baseMint, buyers[buyerIndex].publicKey);
+
         const sellTx = new VersionedTransaction(
             new TransactionMessage({
                 payerKey: buyers[buyerIndex].publicKey,
                 recentBlockhash: (await connection.getLatestBlockhash()).blockhash,
                 instructions: [
                     getBuyIx(pool, baseMint, quoteMint, buyers[buyerIndex].publicKey, BigInt(solAmount.toString()), BigInt(tokenAmount)),
-                    createCloseAccountInstruction(wsolAta, buyers[buyerIndex].publicKey, buyers[buyerIndex].publicKey),
-                    getTipInstruction(buyers[buyerIndex].publicKey, ZERO_SLOT_TIP),
+                    //createCloseAccountInstruction(wsolAta, buyers[buyerIndex].publicKey, buyers[buyerIndex].publicKey),
+                    ComputeBudgetProgram.setComputeUnitPrice({
+                        microLamports: SELL_PRIORITY_FEE,
+                    }),
                 ],
             }).compileToV0Message()
         );
         sellTx.sign([buyers[buyerIndex]]);
-        await sendTransaction(sellTx);
+        await connection.sendTransaction(sellTx, {
+            skipPreflight: true,
+        });
         console.log(quoteMint.toBase58(), "Sell transaction sent", bs58.encode(sellTx.signatures[0]));
     } catch (error) {
-        console.error("Error processing exit transaction:", error);
+        console.error("Error processing sell transaction:", error);
         console.error("Pool:", pool.toBase58(), "Base Mint:", baseMint.toBase58(), "Quote Mint:", quoteMint.toBase58());
         console.error("Buyer Index:", buyerIndex);
     }
@@ -344,7 +362,9 @@ eventEmitter.on(
     ) => {
         try {
             const decodedIx = decodeSystemTransferIx(transferIx, accountKeys);
-            //console.log("Decoded transfer instruction:", decodedIx);
+            if (!decodedIx) {
+                return;
+            }
 
             if (Number(decodedIx.lamports) < TRANSFER_MIN_AMOUNT) {
                 return;
