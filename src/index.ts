@@ -40,6 +40,8 @@ const connection = new Connection(process.env.RPC_URL!, "processed");
 
 const ZERO_SLOT_TIP = 0.001 * LAMPORTS_PER_SOL;
 const SELL_PRIORITY_FEE = 50000; // micro lamports
+const BUY_PRIORITY_FEE = 100000;
+
 const SELL_MIN_AMOUNT = BigInt(0.001 * LAMPORTS_PER_SOL);
 const SLIPPAGE = 10;
 
@@ -48,6 +50,7 @@ const TRANSFER_MIN_AMOUNT = 100 * LAMPORTS_PER_SOL;
 
 let currentBuyerIndex = 0;
 const MAX_PROFIT_RUG_DIFFERENCE = 3;
+const MAX_PROFIT_TIMEOUT_DIFFERENCE = 3;
 
 const eventEmitter = new EventEmitter();
 const pumpswapCoder = new BorshCoder(pumpswap);
@@ -68,41 +71,35 @@ const client = new Client(process.env.GRPC_URL!, undefined, {
     "grpc.max_receive_message_length": 1024 * 1024 * 1024,
 });
 
-let stream: ClientDuplexStream<SubscribeRequest, SubscribeUpdate>;
+let stream: ClientDuplexStream<SubscribeRequest, SubscribeUpdate> | null;
 
 let buysEnabled = true;
 
 async function startSubscription() {
     if (stream) {
         stream.removeAllListeners();
-        const streamClosed = new Promise<void>((resolve, reject) => {
-            stream.on("error", (error) => {
-                reject(error);
-                stream.end();
-            });
-            stream.on("end", () => {
-                resolve();
-            });
-            stream.on("close", () => {
-                resolve();
-            });
-        });
+        const oldStream = stream;
+        stream = null;
 
-        stream.end();
-        await streamClosed;
+        await new Promise<void>((resolve) => {
+            oldStream.once("close", resolve);
+            oldStream.once("end", resolve);
+            oldStream.once("error", () => resolve());
+            oldStream.end();
+        });
     }
 
     stream = await client.subscribe();
 
     const streamClosed = new Promise<void>((resolve, reject) => {
-        stream.on("error", (error) => {
+        stream!.on("error", (error) => {
             reject(error);
-            stream.end();
+            stream!.end();
         });
-        stream.on("end", () => {
+        stream!.on("end", () => {
             resolve();
         });
-        stream.on("close", () => {
+        stream!.on("close", () => {
             resolve();
         });
     });
@@ -117,7 +114,7 @@ async function startSubscription() {
     });
 
     await new Promise<void>((resolve, reject) => {
-        stream.write(
+        stream!.write(
             {
                 commitment: CommitmentLevel.PROCESSED,
                 accountsDataSlice: [],
@@ -151,8 +148,6 @@ async function startSubscription() {
             }
         );
     });
-
-    console.log("Stream started");
 
     await streamClosed;
 
@@ -189,8 +184,12 @@ eventEmitter.on(
     async (pool: PublicKey, baseMint: PublicKey, quoteMint: PublicKey, creator: PublicKey, buyerIndex: number, recentBlockhash: string) => {
         try {
             const creatorIndex = targets.findIndex((target) => target.toBase58() === creator.toBase58());
-            if (rugs[creatorIndex] - profits[creatorIndex] > MAX_PROFIT_RUG_DIFFERENCE) {
+            if (rugs[creatorIndex] > profits[creatorIndex] + MAX_PROFIT_RUG_DIFFERENCE) {
                 console.log("Skipping pool due to high profit/rug difference for creator", creator.toBase58());
+                return;
+            }
+            if (timeouts[creatorIndex] > profits[creatorIndex] + MAX_PROFIT_TIMEOUT_DIFFERENCE) {
+                console.log("Skipping pool due to high profit/timeout difference for creator", creator.toBase58());
                 return;
             }
 
@@ -230,7 +229,8 @@ eventEmitter.on(
                             BigInt(buyAmountSol[creatorIndex] * LAMPORTS_PER_SOL),
                             QUOTE_AMOUNT_OUT
                         ),
-                        getTipInstruction(buyers[buyerIndex].publicKey, ZERO_SLOT_TIP),
+                        //getTipInstruction(buyers[buyerIndex].publicKey, ZERO_SLOT_TIP),
+                        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: BUY_PRIORITY_FEE }),
                     ],
                 }).compileToV0Message()
             );
@@ -238,8 +238,13 @@ eventEmitter.on(
             tx.sign([buyers[buyerIndex]]);
             console.log("buyer", buyers[currentBuyerIndex].publicKey.toBase58());
 
-            await sendTransaction(tx);
+            const id = await connection.sendTransaction(tx, { skipPreflight: true });
             console.log(quoteMint.toBase58(), "buy transaction sent", bs58.encode(tx.signatures[0]));
+
+            const { lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+            await connection
+                .confirmTransaction({ blockhash: recentBlockhash, lastValidBlockHeight: lastValidBlockHeight, signature: id }, "processed")
+                .catch();
             eventEmitter.emit("exit", pool, baseMint, quoteMint, buyerIndex, creator);
         } catch (error) {
             console.error("Error processing buy transaction:", error);
@@ -388,7 +393,9 @@ eventEmitter.on(
             if (!decodedIx) {
                 return;
             }
-
+            if (decodedIx.to === "EzDKVb5rr1U6SCfbNGjeZW8yTGTJdJvYtdZwAfck8PQU") {
+                console.log("here");
+            }
             if (Number(decodedIx.lamports) < TRANSFER_MIN_AMOUNT) {
                 return;
             }
@@ -446,8 +453,7 @@ async function updateTargets() {
         for (const target of targets) {
             const targetBalance = await connection.getBalance(target, "processed");
             if (targetBalance > MAX_SOL_TO_SEARCH_CHILDREN) continue;
-            // console.log(`Found an empty wallet: ${target.toBase58()}`);
-            const transactions = (await connection.getSignaturesForAddress(target, { limit: 10 }, "confirmed")).map(
+            const transactions = (await connection.getSignaturesForAddress(target, { limit: 7 }, "confirmed")).map(
                 (transaction) => transaction.signature
             );
             const messages: (Message | MessageV0)[] = (
@@ -488,9 +494,7 @@ async function updateTargets() {
                 //}
             }
         }
-    } catch (e) {
-        console.error(`error while updating targets`, e);
-    }
+    } catch {}
 }
 
 async function main() {
