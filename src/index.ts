@@ -1,10 +1,13 @@
 import { EventEmitter } from "events";
 import * as dotenv from "dotenv";
 import {
+    CompiledInstruction,
     ComputeBudgetProgram,
     Connection,
     Keypair,
     LAMPORTS_PER_SOL,
+    Message,
+    MessageV0,
     PublicKey,
     SystemProgram,
     TransactionMessage,
@@ -12,7 +15,6 @@ import {
 } from "@solana/web3.js";
 import {
     createAssociatedTokenAccountIdempotentInstruction,
-    createCloseAccountInstruction,
     createSyncNativeInstruction,
     getAccount,
     getAssociatedTokenAddressSync,
@@ -32,12 +34,14 @@ import { decodeSystemTransferIx } from "./system-program";
 import { loadBuyersCsv, loadTargetsCsv, writeTargetsCsv } from "./utils/read-csv";
 import { SYSTEM_PROGRAM_ID } from "@coral-xyz/anchor/dist/cjs/native/system";
 import { getDate } from "./utils/date";
+
 dotenv.config();
 const connection = new Connection(process.env.RPC_URL!, "processed");
 
 const ZERO_SLOT_TIP = 0.001 * LAMPORTS_PER_SOL;
 const SELL_PRIORITY_FEE = 50000; // micro lamports
 const SELL_MIN_AMOUNT = BigInt(0.001 * LAMPORTS_PER_SOL);
+const SLIPPAGE = 10;
 
 const QUOTE_AMOUNT_OUT = BigInt(0);
 const TRANSFER_MIN_AMOUNT = 100 * LAMPORTS_PER_SOL;
@@ -65,6 +69,8 @@ const client = new Client(process.env.GRPC_URL!, undefined, {
 });
 
 let stream: ClientDuplexStream<SubscribeRequest, SubscribeUpdate>;
+
+let buysEnabled = true;
 
 async function startSubscription() {
     if (stream) {
@@ -123,13 +129,13 @@ async function startSubscription() {
                         accountExclude: [],
                         accountRequired: [pumpswap.address],
                     },
-                    transfer: {
-                        vote: false,
-                        failed: false,
-                        accountInclude: [...targets.map((t) => t.toBase58())],
-                        accountExclude: [],
-                        accountRequired: [SystemProgram.programId.toBase58()],
-                    },
+                    // transfer: {
+                    //     vote: false,
+                    //     failed: false,
+                    //     accountInclude: [...targets.map((t) => t.toBase58())],
+                    //     accountExclude: [],
+                    //     accountRequired: [SystemProgram.programId.toBase58()],
+                    // },
                 },
                 accounts: {},
                 slots: {},
@@ -153,18 +159,7 @@ async function startSubscription() {
 }
 
 eventEmitter.on("transaction", async (grpcResponse: GRPCResponse) => {
-    const accountKeys = grpcResponse.transaction.transaction.message.accountKeys.map((key) => new PublicKey(key));
-
-    const hasThirdPartyProgram = grpcResponse.transaction.transaction.message.instructions.some((ix) => {
-        if (accountKeys[ix.programIdIndex].toBase58() === SYSTEM_PROGRAM_ID.toBase58()) return false;
-        if (accountKeys[ix.programIdIndex].toBase58() === ComputeBudgetProgram.programId.toBase58()) return false;
-        return true;
-    });
-    if (!hasThirdPartyProgram) {
-        grpcResponse.transaction.transaction.message.instructions.map((ix) => {
-            eventEmitter.emit("transfer", ix, accountKeys);
-        });
-    }
+    if (!buysEnabled) return;
 
     const createIx = grpcResponse.transaction.transaction.message.instructions.find((i) =>
         pumpswapCoder.instruction.decode(i.data, "base58")?.name.startsWith("create_pool")
@@ -282,7 +277,9 @@ eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
                     break;
                 }
 
-                const solAmount = BigInt((await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 5)).toString());
+                const solAmount = BigInt(
+                    (await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), SLIPPAGE)).toString()
+                );
 
                 console.log(
                     `token: ${quoteMint}, value: ${(Number(solAmount) / LAMPORTS_PER_SOL).toFixed(4)}, profitTarget: ${Number(
@@ -322,9 +319,9 @@ eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
 
         writeTargetsCsv("targets.csv", targets, profits, rugs, timeouts, buyAmountSol, takeProfitSol, timeoutMs, lastUpdate, note);
 
-        let solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 10);
+        let solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), SLIPPAGE);
 
-        for (let i = 0; i < 5; i++) {
+        for (let i = 0; i < 7; i++) {
             try {
                 if (BigInt(solAmount.toString()) < SELL_MIN_AMOUNT) {
                     break;
@@ -333,7 +330,7 @@ eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
 
                 await new Promise((r) => setTimeout(r, 3000));
 
-                solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 10);
+                solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), SLIPPAGE);
                 tokenAmount = (await getAccount(connection, tokenAta, "processed")).amount;
             } catch {}
         }
@@ -394,8 +391,6 @@ eventEmitter.on(
             if (Number(decodedIx.lamports) < TRANSFER_MIN_AMOUNT) {
                 return;
             }
-            // console.log("Decoded lamports:", Number(decodedIx.lamports) / LAMPORTS_PER_SOL);
-            // console.log("from", decodedIx.from, "to", decodedIx.to);
             const index = targets.findIndex((pk) => pk.toBase58() === decodedIx.from);
             if (index !== -1) {
                 targets[index] = new PublicKey(decodedIx.to);
@@ -421,28 +416,84 @@ eventEmitter.on(
 
 const MAX_SOL_TO_SEARCH_CHILDREN = 0.1 * LAMPORTS_PER_SOL;
 
-async function updateTargets() {
-    for (const target of targets) {
-        const targetBalance = await connection.getBalance(target, "processed");
-        if (targetBalance > MAX_SOL_TO_SEARCH_CHILDREN) continue;
-        console.log(`Found an empty wallet: ${target.toBase58()}`);
-        const transactions = (await connection.getSignaturesForAddress(target, { limit: 5 }, "confirmed")).map(
-            (transaction) => transaction.signature
-        );
+function setupConsoleInput() {
+    process.stdin.setEncoding("utf8");
 
-        const txs = (await connection.getTransactions(transactions, { commitment: "confirmed", maxSupportedTransactionVersion: 0 })).filter(
-            (tx) => tx !== null
-        );
+    process.stdin.on("data", (input: string) => {
+        const command = input.trim().toLowerCase();
 
-        for (const tx of txs) {
-            const ixs = tx.transaction.message;
-            console.log(ixs);
-            return;
+        switch (command) {
+            case "p":
+                buysEnabled = false;
+                console.log("🛑 Buying stopped. Will only sell.");
+                break;
+            case "s":
+                buysEnabled = true;
+                console.log("▶️ Resumed buying.");
+                break;
+            case "e":
+                console.log("🚪 Exiting gracefully...");
+                process.exit(0);
+            default:
+                console.log(`❓ Unknown command: "${command}". Try "p", "s", or "e".`);
         }
+    });
+}
+
+async function updateTargets() {
+    try {
+        for (const target of targets) {
+            const targetBalance = await connection.getBalance(target, "processed");
+            if (targetBalance > MAX_SOL_TO_SEARCH_CHILDREN) continue;
+            // console.log(`Found an empty wallet: ${target.toBase58()}`);
+            const transactions = (await connection.getSignaturesForAddress(target, { limit: 10 }, "confirmed")).map(
+                (transaction) => transaction.signature
+            );
+            const messages: (Message | MessageV0)[] = (
+                await connection.getTransactions(transactions, { commitment: "confirmed", maxSupportedTransactionVersion: 0 })
+            )
+                .filter((tx) => tx !== null)
+                .map((message) => message.transaction.message);
+
+            for (const message of messages) {
+                //console.log(message);
+                let instructions: CompiledInstruction[] = [];
+                let accountKeys: PublicKey[] = [];
+
+                if (message instanceof Message) {
+                    instructions = message.instructions;
+                    accountKeys = message.accountKeys;
+                } else if (message instanceof MessageV0) {
+                    instructions = message.compiledInstructions.map((ix) => ({
+                        programIdIndex: ix.programIdIndex,
+                        accounts: ix.accountKeyIndexes,
+                        data: bs58.encode(ix.data),
+                    }));
+
+                    accountKeys = message.staticAccountKeys;
+                }
+                const hasThirdPartyProgram = instructions.some((ix) => {
+                    if (accountKeys[ix.programIdIndex].toBase58() === SYSTEM_PROGRAM_ID.toBase58()) return false;
+                    if (accountKeys[ix.programIdIndex].toBase58() === ComputeBudgetProgram.programId.toBase58()) return false;
+                    return true;
+                });
+                if (hasThirdPartyProgram) {
+                    continue;
+                }
+
+                for (const instruction of instructions) {
+                    eventEmitter.emit("transfer", instruction, accountKeys);
+                }
+                //}
+            }
+        }
+    } catch (e) {
+        console.error(`error while updating targets`, e);
     }
 }
 
 async function main() {
+    setupConsoleInput();
     buyers = await loadBuyersCsv("buyers.csv");
     const [
         targetsValues,
@@ -458,7 +509,6 @@ async function main() {
 
     currentBuyerIndex = Math.floor(Math.random() * buyers.length);
     console.log("Current buyer index:", currentBuyerIndex);
-    console.log("date", getDate());
     targets = targetsValues;
     profits = profitsValues;
     rugs = rugsValues;
@@ -469,8 +519,11 @@ async function main() {
     lastUpdate = lastUpdateValues;
     note = noteValues;
 
-    await updateTargets();
-    //await startSubscription();
+    setInterval(() => {
+        updateTargets();
+    }, 10000);
+
+    await startSubscription();
     console.log("Subscription started. Waiting for transactions...");
 }
 
