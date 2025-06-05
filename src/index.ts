@@ -58,6 +58,7 @@ let buyAmountSol: number[] = [];
 let takeProfitSol: number[] = [];
 let timeoutMs: number[] = [];
 let lastUpdate: string[] = [];
+let note: string[] = [];
 
 const client = new Client(process.env.GRPC_URL!, undefined, {
     "grpc.max_receive_message_length": 1024 * 1024 * 1024,
@@ -299,7 +300,18 @@ eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
                     console.log("YOU GOT RUGGED");
                     rugs[creatorIndex] = rugs[creatorIndex] + 1;
 
-                    writeTargetsCsv("targets.csv", targets, profits, rugs, timeouts, buyAmountSol, takeProfitSol, timeoutMs, lastUpdate);
+                    writeTargetsCsv(
+                        "targets.csv",
+                        targets,
+                        profits,
+                        rugs,
+                        timeouts,
+                        buyAmountSol,
+                        takeProfitSol,
+                        timeoutMs,
+                        lastUpdate,
+                        note
+                    );
                     return;
                 }
                 await new Promise((r) => setTimeout(r, 1000));
@@ -308,7 +320,7 @@ eventEmitter.on("exit", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
             }
         }
 
-        writeTargetsCsv("targets.csv", targets, profits, rugs, timeouts, buyAmountSol, takeProfitSol, timeoutMs, lastUpdate);
+        writeTargetsCsv("targets.csv", targets, profits, rugs, timeouts, buyAmountSol, takeProfitSol, timeoutMs, lastUpdate, note);
 
         let solAmount = await calculateBaseFromQuote(connection, pool, new BN(tokenAmount.toString()), 10);
 
@@ -390,7 +402,7 @@ eventEmitter.on(
                 lastUpdate[index] = getDate();
                 console.log(`Target updated: ${decodedIx.from} -> ${decodedIx.to}`);
 
-                writeTargetsCsv("targets.csv", targets, profits, rugs, timeouts, buyAmountSol, takeProfitSol, timeoutMs, lastUpdate);
+                writeTargetsCsv("targets.csv", targets, profits, rugs, timeouts, buyAmountSol, takeProfitSol, timeoutMs, lastUpdate, note);
 
                 await startSubscription();
             } else {
@@ -407,6 +419,21 @@ eventEmitter.on(
     }
 );
 
+// const MAX_SOL_TO_SEARCH_CHILDREN = 0.1 * LAMPORTS_PER_SOL;
+
+// async function updateTargets() {
+//     for (const target of targets) {
+//         const targetBalance = await connection.getBalance(target, "processed");
+//         if (targetBalance > MAX_SOL_TO_SEARCH_CHILDREN) continue;
+//         const transactions = (await connection.getSignaturesForAddress(target, { limit: 30 }, "confirmed")).map(
+//             (transaction) => transaction.signature
+//         );
+//         for (const transaction of transactions) {
+//             const tx = await connection.getTransactions;
+//         }
+//     }
+// }
+
 async function main() {
     buyers = await loadBuyersCsv("buyers.csv");
     const [
@@ -418,6 +445,7 @@ async function main() {
         takeProfitSolValues,
         timeoutMsValues,
         lastUpdateValues,
+        noteValues,
     ] = await loadTargetsCsv("targets.csv");
 
     currentBuyerIndex = Math.floor(Math.random() * buyers.length);
@@ -431,7 +459,9 @@ async function main() {
     takeProfitSol = takeProfitSolValues;
     timeoutMs = timeoutMsValues;
     lastUpdate = lastUpdateValues;
+    note = noteValues;
 
+    //await updateTargets();
     await startSubscription();
     console.log("Subscription started. Waiting for transactions...");
 }

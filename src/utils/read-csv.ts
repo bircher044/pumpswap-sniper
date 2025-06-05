@@ -27,7 +27,7 @@ export async function loadBuyersCsv(filePath: string): Promise<Keypair[]> {
 }
 export async function loadTargetsCsv(
     filePath: string
-): Promise<[PublicKey[], number[], number[], number[], number[], number[], number[], string[]]> {
+): Promise<[PublicKey[], number[], number[], number[], number[], number[], number[], string[], string[]]> {
     const targets: PublicKey[] = [];
     const profits: number[] = [];
     const rugs: number[] = [];
@@ -36,6 +36,7 @@ export async function loadTargetsCsv(
     const takeProfitSol: number[] = [];
     const timeoutMs: number[] = [];
     const lastUpdate: string[] = [];
+    const note: string[] = [];
 
     return new Promise((resolve, reject) => {
         fs.createReadStream(filePath)
@@ -50,6 +51,7 @@ export async function loadTargetsCsv(
                     const takeProfit = row["takeProfitSol"];
                     const timeoutMsValue = row["timeoutMs"];
                     const lastUpdateValue = row["lastUpdate"];
+                    const noteValue = row["note"];
 
                     if (
                         !address ||
@@ -72,18 +74,19 @@ export async function loadTargetsCsv(
                     takeProfitSol.push(Number(takeProfit));
                     timeoutMs.push(Number(timeoutMsValue));
                     lastUpdate.push(lastUpdateValue);
+                    note.push(noteValue);
                 } catch (err) {
                     reject(new Error(`Error processing row: ${JSON.stringify(row)}\n${err}`));
                 }
             })
             .on("end", () => {
-                resolve([targets, profits, rugs, timeouts, buyAmountSol, takeProfitSol, timeoutMs, lastUpdate]);
+                resolve([targets, profits, rugs, timeouts, buyAmountSol, takeProfitSol, timeoutMs, lastUpdate, note]);
             })
             .on("error", (err: Error) => {
                 reject(new Error(`Error reading file "${filePath}": ${err.message}`));
             });
     });
-} //AuwukFJynq5u1h35fhQ5PrPjPuA1MAjDCTkhEh8ZWRx5
+}
 
 export async function writeTargetsCsv(
     filePath: string,
@@ -94,7 +97,8 @@ export async function writeTargetsCsv(
     buyAmountSol: number[],
     takeProfitSol: number[],
     timeoutMs: number[],
-    lastUpdate: string[]
+    lastUpdate: string[],
+    note: string[]
 ): Promise<void> {
     if (
         targets.length !== profits.length ||
@@ -108,7 +112,7 @@ export async function writeTargetsCsv(
         throw new Error("All arrays must have the same length.");
     }
 
-    const header = "targets,profits,rugs,timeouts,buyAmountSol,takeProfitSol,timeoutMs,lastUpdate\n";
+    const header = "targets,profits,rugs,timeouts,buyAmountSol,takeProfitSol,timeoutMs,lastUpdate,note\n";
 
     const rows = targets.map(
         (target, index) =>
