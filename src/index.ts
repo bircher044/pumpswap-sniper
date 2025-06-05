@@ -74,6 +74,7 @@ let buysEnabled = true;
 
 async function startSubscription() {
     if (stream) {
+        stream.removeAllListeners();
         const streamClosed = new Promise<void>((resolve, reject) => {
             stream.on("error", (error) => {
                 reject(error);
@@ -524,7 +525,6 @@ async function main() {
     }, 10000);
 
     await startSubscription();
-    console.log("Subscription started. Waiting for transactions...");
 }
 
 main().catch(console.error);
