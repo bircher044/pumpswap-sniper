@@ -118,7 +118,7 @@ export async function writeTargetsCsv(
         (target, index) =>
             `${target.toBase58()},${profits[index]},${rugs[index]},${timeouts[index]},${buyAmountSol[index]},${takeProfitSol[index]},${
                 timeoutMs[index]
-            },${lastUpdate[index]}`
+            },${lastUpdate[index]},${note[index]}`
     );
 
     const csvContent = header + rows.join("\n");
