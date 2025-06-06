@@ -15,6 +15,7 @@ import {
 } from "@solana/web3.js";
 import {
     createAssociatedTokenAccountIdempotentInstruction,
+    createCloseAccountInstruction,
     createSyncNativeInstruction,
     getAccount,
     getAssociatedTokenAddressSync,
@@ -351,15 +352,21 @@ eventEmitter.on("sell", async (pool: PublicKey, baseMint: PublicKey, quoteMint: 
     try {
         const tokenAta = getAssociatedTokenAddressSync(quoteMint, buyers[buyerIndex].publicKey);
         const tokenAmount = (await getAccount(connection, tokenAta, "processed")).amount;
-        //const wsolAta = getAssociatedTokenAddressSync(baseMint, buyers[buyerIndex].publicKey);
+        const wsolAta = getAssociatedTokenAddressSync(baseMint, buyers[buyerIndex].publicKey);
 
         const sellTx = new VersionedTransaction(
             new TransactionMessage({
                 payerKey: buyers[buyerIndex].publicKey,
                 recentBlockhash: (await connection.getLatestBlockhash()).blockhash,
                 instructions: [
+                    createAssociatedTokenAccountIdempotentInstruction(
+                        buyers[buyerIndex].publicKey,
+                        wsolAta,
+                        buyers[buyerIndex].publicKey,
+                        baseMint
+                    ),
                     getBuyIx(pool, baseMint, quoteMint, buyers[buyerIndex].publicKey, BigInt(solAmount.toString()), BigInt(tokenAmount)),
-                    //createCloseAccountInstruction(wsolAta, buyers[buyerIndex].publicKey, buyers[buyerIndex].publicKey),
+                    createCloseAccountInstruction(wsolAta, buyers[buyerIndex].publicKey, buyers[buyerIndex].publicKey),
                     ComputeBudgetProgram.setComputeUnitPrice({
                         microLamports: SELL_PRIORITY_FEE,
                     }),
@@ -393,9 +400,6 @@ eventEmitter.on(
             if (!decodedIx) {
                 return;
             }
-            if (decodedIx.to === "EzDKVb5rr1U6SCfbNGjeZW8yTGTJdJvYtdZwAfck8PQU") {
-                console.log("here");
-            }
             if (Number(decodedIx.lamports) < TRANSFER_MIN_AMOUNT) {
                 return;
             }
@@ -403,6 +407,7 @@ eventEmitter.on(
             if (index !== -1) {
                 targets[index] = new PublicKey(decodedIx.to);
                 lastUpdate[index] = getDate();
+                note[index] = note[index] + ` ${(Number(decodedIx.lamports) / LAMPORTS_PER_SOL).toFixed(2)}`;
                 console.log(`Target updated: ${decodedIx.from} -> ${decodedIx.to}`);
 
                 writeTargetsCsv("targets.csv", targets, profits, rugs, timeouts, buyAmountSol, takeProfitSol, timeoutMs, lastUpdate, note);
@@ -526,7 +531,7 @@ async function main() {
 
     setInterval(() => {
         updateTargets();
-    }, 10000);
+    }, 15000);
 
     await startSubscription();
 }
